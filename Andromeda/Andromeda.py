@@ -1,0 +1,22 @@
+
+import numpy as np
+from Softmax import my_softmax
+from Attention import andromeda_attention
+from Layernorm import AndromedaBlock, my_layer_norm
+
+
+if __name__ == "__main__":
+    np.random.seed(42)
+    block = AndromedaBlock(dim=64, n_heads=4)
+    x = np.random.randn(1, 8, 64)
+
+
+    seq_len = x.shape[1]
+    mask = np.triu(np.full((seq_len, seq_len), -1e9), k=1)
+    mask = mask[None, None, :, :]
+
+    output = block.forward(x, mask)
+    print("ANDROMEDA BLOCK WERKT PERFECT!")
+    print("Input shape:", x.shape)
+    print("Output shape:", output.shape)
+    print("Eerste token, eerste 5 waarden:", output[0, 0, :5].round(4))
