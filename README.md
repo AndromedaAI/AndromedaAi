@@ -1,16 +1,13 @@
-## Hi there 👋
 
-<!--
-**AndromedaAI/AndromedaAi** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+Andromeda is een open-source serie LLMs gebouwd from scratch voor financiële toepassingen.
 
-Here are some ideas to get you started:
+Wat is Andromeda?
+- **v0.1**: Basis transformer blocks (attention, LayerNorm, FF) in pure NumPy/JAX.
+- **Toekomst**: 1.5B MoE model getraind op tick-data + macro dat + persoonlijke trades.
+- **Doel**: Een "Fin AGI" die hedgefondsen en traders helpt met edge.
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+Quick Start
+bash
+git clone https://github.com/AndromedaAI/andromeda-core.git
+cd andromeda-core
+python andromeda.py
