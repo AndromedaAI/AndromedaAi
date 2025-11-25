@@ -1,13 +1,7 @@
+Andromeda is an open-source series of LLMs built from scratch specifically for financial applications.
+What is Andromeda?
 
-Andromeda is een open-source serie LLMs gebouwd from scratch voor financiële toepassingen.
+v0.1: Basic transformer blocks (attention, LayerNorm, FF) implemented in pure NumPy/JAX.
+Future: 1.5B parameter Mixture-of-Experts (MoE) model trained on tick data + macroeconomic data + personal trades and experience.
+Goal: A "Fin AGI" that gives hedge funds and traders a real edge.
 
-Wat is Andromeda?
-- **v0.1**: Basis transformer blocks (attention, LayerNorm, FF) in pure NumPy/JAX.
-- **Toekomst**: 1.5B MoE model getraind op tick-data + macro dat + persoonlijke trades en ervaring.
-- **Doel**: Een "Fin AGI" die hedgefondsen en traders helpt met edge.
-
-Quick Start
-bash
-git clone https://github.com/AndromedaAI/andromeda-core.git
-cd andromeda-core
-python andromeda.py
