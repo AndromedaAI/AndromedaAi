@@ -1,0 +1,403 @@
+def validate_trade(trade: dict) -> None:
+    """
+    Hard validator voor trade JSON.
+    Gooit Exception bij elke inconsistentie.
+    """
+
+    REQUIRED_TOP_LEVEL_KEYS = [
+        "trade_id",
+        "date",
+        "instrument",
+        "direction",
+        "entry",
+        "sl",
+        "risk_points",
+        "planned_exits",
+        "actual_exits",
+        "mfe_price",
+        "mae_price",
+        "mae_points",
+        "post_exit_excursion_price",
+        "post_exit_excursion_capture_pct",
+        "post_sl_peep_price",
+        "post_sl_peep_capture_pct",
+        "realized_r",
+        "max_possible_r",
+        "mfe_capture_pct",
+        "confluence",
+        "reasoning",
+        "edge_score",
+        "session",
+        "smt_leader",
+        "smt_lagger",
+        "stop_loss_details",
+        "outcome",
+        "alternate_index_trades"
+    ]
+
+    # ---- basic structure ----
+    for key in REQUIRED_TOP_LEVEL_KEYS:
+        if key not in trade:
+            raise ValueError(f"[STRUCTURE] Missing required field: '{key}'")
+
+    # ---- basic type checks ----
+    if not isinstance(trade["trade_id"], str) or trade["trade_id"] == "":
+        raise ValueError(f"[TYPE] trade_id must be non-empty string, got: {trade['trade_id']}")
+
+    if not isinstance(trade["date"], str) or trade["date"] == "":
+        raise ValueError(f"[TYPE] date must be non-empty string, got: {trade['date']}")
+
+    if trade["instrument"] not in ["ES", "NQ", "YM", ""]:
+        raise ValueError(f"[TYPE] Invalid instrument: {trade['instrument']}")
+
+    if trade["direction"] not in ["long", "short", ""]:
+        raise ValueError(f"[TYPE] Invalid direction: {trade['direction']}")
+
+    if not isinstance(trade["entry"], (int, float)) or trade["entry"] == 0:
+        raise ValueError(f"[TYPE] entry must be non-zero number, got: {trade['entry']}")
+
+    if not isinstance(trade["sl"], (int, float)) or trade["sl"] == 0:
+        raise ValueError(f"[TYPE] sl must be non-zero number, got: {trade['sl']}")
+
+    # ---- risk points ----
+    expected_risk = abs(trade["entry"] - trade["sl"])
+    if abs(round(expected_risk, 2) - round(trade["risk_points"], 2)) > 0.01:
+        raise ValueError(
+            f"[RISK] risk_points incorrect. "
+            f"Expected {expected_risk:.2f}, got {trade['risk_points']}"
+        )
+
+    # ---- MAE points ----
+    expected_mae = abs(trade["entry"] - trade["mae_price"])
+    if abs(round(expected_mae, 2) - round(trade["mae_points"], 2)) > 0.01:
+        raise ValueError(
+            f"[MAE] mae_points incorrect. "
+            f"Expected {expected_mae:.2f}, got {trade['mae_points']}"
+        )
+
+    # ---- actual exits % ----
+    if len(trade["actual_exits"]) > 0:
+        total_exit_pct = sum(exit["close_pct_remaining"] for exit in trade["actual_exits"])
+        if total_exit_pct != 100:
+            raise ValueError(
+                f"[EXITS] actual_exits close_pct_remaining must sum to 100, got {total_exit_pct}"
+            )
+    else:
+        raise ValueError("[EXITS] actual_exits cannot be empty")
+
+    # ---- planned exits structure ----
+    if len(trade["planned_exits"]) == 0:
+        raise ValueError("[PLANNED_EXITS] planned_exits cannot be empty")
+
+    for pe in trade["planned_exits"]:
+        if "price" not in pe or "reason" not in pe:
+            raise ValueError("[PLANNED_EXITS] Each planned exit must have 'price' and 'reason'")
+        if not isinstance(pe["price"], (int, float)):
+            raise ValueError(f"[PLANNED_EXITS] price must be number, got: {pe['price']}")
+
+    # ---- actual exits structure ----
+    for ae in trade["actual_exits"]:
+        if "price" not in ae or "close_pct_remaining" not in ae:
+            raise ValueError("[ACTUAL_EXITS] Each actual exit must have 'price' and 'close_pct_remaining'")
+        if not isinstance(ae["price"], (int, float)):
+            raise ValueError(f"[ACTUAL_EXITS] price must be number, got: {ae['price']}")
+        if not isinstance(ae["close_pct_remaining"], int):
+            raise ValueError(f"[ACTUAL_EXITS] close_pct_remaining must be int, got: {ae['close_pct_remaining']}")
+
+    # ---- MFE/MAE prices ----
+    if not isinstance(trade["mfe_price"], (int, float)) or trade["mfe_price"] == 0:
+        raise ValueError(f"[MFE] mfe_price must be non-zero number, got: {trade['mfe_price']}")
+
+    if not isinstance(trade["mae_price"], (int, float)) or trade["mae_price"] == 0:
+        raise ValueError(f"[MAE] mae_price must be non-zero number, got: {trade['mae_price']}")
+
+    # ---- MFE capture (alleen checken als realized_r > 0) ----
+    if trade["realized_r"] > 0 and len(trade["actual_exits"]) > 0:
+        direction = trade["direction"]
+        entry = trade["entry"]
+
+        furthest_tp = (
+            min(e["price"] for e in trade["actual_exits"])
+            if direction == "short"
+            else max(e["price"] for e in trade["actual_exits"])
+        )
+
+        mfe_movement = abs(trade["mfe_price"] - entry)
+        tp_movement = abs(furthest_tp - entry)
+
+        if mfe_movement == 0:
+            if trade["mfe_capture_pct"] != 0:
+                raise ValueError("[MFE] mfe_price equals entry, capture should be 0")
+        else:
+            expected_mfe_capture = round((tp_movement / mfe_movement) * 100)
+            if abs(expected_mfe_capture - trade["mfe_capture_pct"]) > 2:
+                raise ValueError(
+                    f"[MFE] mfe_capture_pct incorrect. "
+                    f"Expected ~{expected_mfe_capture}%, got {trade['mfe_capture_pct']}%"
+                )
+    elif trade["realized_r"] < 0:
+        # Bij loss moet MFE capture 0 zijn
+        if trade["mfe_capture_pct"] != 0:
+            raise ValueError(f"[MFE] Loss trade should have 0% MFE capture, got {trade['mfe_capture_pct']}%")
+
+    # ---- PEEP capture (alleen checken als realized_r > 0 en PEEP > 0) ----
+    if trade["realized_r"] > 0 and trade["post_exit_excursion_price"] > 0 and len(trade["actual_exits"]) > 0:
+        direction = trade["direction"]
+        entry = trade["entry"]
+
+        furthest_tp = (
+            min(e["price"] for e in trade["actual_exits"])
+            if direction == "short"
+            else max(e["price"] for e in trade["actual_exits"])
+        )
+
+        peep_movement = abs(trade["post_exit_excursion_price"] - entry)
+        tp_movement = abs(furthest_tp - entry)
+
+        if peep_movement == 0:
+            if trade["post_exit_excursion_capture_pct"] != 0:
+                raise ValueError("[PEEP] peep equals entry, capture should be 0")
+        else:
+            expected_peep_capture = round((tp_movement / peep_movement) * 100)
+            if abs(expected_peep_capture - trade["post_exit_excursion_capture_pct"]) > 2:
+                raise ValueError(
+                    f"[PEEP] post_exit_excursion_capture_pct incorrect. "
+                    f"Expected ~{expected_peep_capture}%, got {trade['post_exit_excursion_capture_pct']}%"
+                )
+    elif trade["realized_r"] < 0:
+        # Bij loss moet PEEP capture 0 zijn
+        if trade["post_exit_excursion_capture_pct"] != 0:
+            raise ValueError(
+                f"[PEEP] Loss trade should have 0% PEEP capture, got {trade['post_exit_excursion_capture_pct']}%")
+
+    # ---- PSPP (alleen voor stopped out trades) ----
+    if trade["realized_r"] < 0:
+        # Als stopped out, moet PSPP een nummer zijn (niet "null")
+        if trade["post_sl_peep_price"] == "null":
+            raise ValueError("[PSPP] Stopped out trade must have post_sl_peep_price (not 'null')")
+        if not isinstance(trade["post_sl_peep_price"], (int, float)):
+            raise ValueError(f"[PSPP] post_sl_peep_price must be number for loss, got: {trade['post_sl_peep_price']}")
+
+        if trade["post_sl_peep_capture_pct"] == "null":
+            raise ValueError("[PSPP] Stopped out trade must have post_sl_peep_capture_pct (not 'null')")
+        if not isinstance(trade["post_sl_peep_capture_pct"], (int, float)):
+            raise ValueError(
+                f"[PSPP] post_sl_peep_capture_pct must be number for loss, got: {trade['post_sl_peep_capture_pct']}")
+    else:
+        # Als winning trade, moet PSPP "null" zijn
+        if trade["post_sl_peep_price"] != "null":
+            raise ValueError(
+                f"[PSPP] Winning trade must have 'null' for post_sl_peep_price, got: {trade['post_sl_peep_price']}")
+        if trade["post_sl_peep_capture_pct"] != "null":
+            raise ValueError(
+                f"[PSPP] Winning trade must have 'null' for post_sl_peep_capture_pct, got: {trade['post_sl_peep_capture_pct']}")
+
+    # ---- stop_loss_details structure ----
+    required_sl_keys = ["type", "distance_from_entry_points", "Was_hit", "closest_approach_points"]
+    for key in required_sl_keys:
+        if key not in trade["stop_loss_details"]:
+            raise ValueError(f"[STOP_LOSS] Missing field in stop_loss_details: '{key}'")
+
+    if not isinstance(trade["stop_loss_details"]["type"], str) or trade["stop_loss_details"]["type"] == "":
+        raise ValueError(f"[STOP_LOSS] type must be non-empty string, got: {trade['stop_loss_details']['type']}")
+
+    if abs(trade["stop_loss_details"]["distance_from_entry_points"] - trade["risk_points"]) > 0.01:
+        raise ValueError(
+            f"[STOP_LOSS] distance_from_entry_points should equal risk_points. "
+            f"Got {trade['stop_loss_details']['distance_from_entry_points']} vs {trade['risk_points']}"
+        )
+
+    if abs(trade["stop_loss_details"]["closest_approach_points"] - trade["mae_points"]) > 0.01:
+        raise ValueError(
+            f"[STOP_LOSS] closest_approach_points should equal mae_points. "
+            f"Got {trade['stop_loss_details']['closest_approach_points']} vs {trade['mae_points']}"
+        )
+
+    if not isinstance(trade["stop_loss_details"]["Was_hit"], bool):
+        raise ValueError(f"[STOP_LOSS] Was_hit must be boolean, got: {trade['stop_loss_details']['Was_hit']}")
+
+    # ---- outcome validation ----
+    required_outcome_keys = ["result", "win_quality"]
+    for key in required_outcome_keys:
+        if key not in trade["outcome"]:
+            raise ValueError(f"[OUTCOME] Missing field: '{key}'")
+
+    if trade["outcome"]["result"] not in ["win", "loss"]:
+        raise ValueError(f"[OUTCOME] Invalid result: {trade['outcome']['result']}")
+
+    if trade["outcome"]["win_quality"] not in ["full_target", "partial_target", "breakeven", "loss"]:
+        raise ValueError(f"[OUTCOME] Invalid win_quality: {trade['outcome']['win_quality']}")
+
+    # Consistency check: if result is loss, win_quality should be loss
+    if trade["outcome"]["result"] == "loss" and trade["outcome"]["win_quality"] != "loss":
+        raise ValueError(f"[OUTCOME] Result is 'loss' but win_quality is '{trade['outcome']['win_quality']}'")
+
+    if trade["outcome"]["result"] == "loss" and not trade["stop_loss_details"]["Was_hit"]:
+        raise ValueError("[OUTCOME] Result is 'loss' but Was_hit is False")
+
+    if trade["outcome"]["result"] == "win" and trade["stop_loss_details"]["Was_hit"]:
+        raise ValueError("[OUTCOME] Result is 'win' but Was_hit is True")
+
+    # ---- confluence & session ----
+    if not isinstance(trade["confluence"], list):
+        raise ValueError("[CONFLUENCE] confluence must be a list")
+
+    if len(trade["confluence"]) == 0:
+        raise ValueError("[CONFLUENCE] confluence cannot be empty")
+
+    if not isinstance(trade["reasoning"], str) or trade["reasoning"] == "":
+        raise ValueError(f"[REASONING] reasoning must be non-empty string, got: '{trade['reasoning']}'")
+
+    if trade["session"] not in ["killzone_morning", "killzone_afternoon", "extended_morning", "market_open"]:
+        raise ValueError(f"[SESSION] Invalid session: '{trade['session']}'")
+
+    if not isinstance(trade["edge_score"], (int, float)) or trade["edge_score"] < 0 or trade["edge_score"] > 100:
+        raise ValueError(f"[EDGE_SCORE] edge_score must be 0-100, got: {trade['edge_score']}")
+
+    # ---- SMT ----
+    if trade["smt_leader"] not in ["ES", "NQ", "none"]:
+        raise ValueError(f"[SMT] Invalid smt_leader: '{trade['smt_leader']}'")
+    if trade["smt_lagger"] not in ["ES", "NQ", "none"]:
+        raise ValueError(f"[SMT] Invalid smt_lagger: '{trade['smt_lagger']}'")
+
+    # Als er SMT is, moet leader/lagger ingevuld zijn
+    has_smt = any("smt" in c.lower() for c in trade["confluence"])
+    if has_smt and (trade["smt_leader"] == "none" or trade["smt_lagger"] == "none"):
+        raise ValueError("[SMT] SMT in confluence but leader/lagger is 'none'")
+
+    # ---- alternate trades ----
+    if not isinstance(trade["alternate_index_trades"], list):
+        raise ValueError("[ALT] alternate_index_trades must be a list")
+
+    for alt in trade["alternate_index_trades"]:
+        validate_alt_trade(alt, trade["direction"])
+
+    # ---- best_index_evaluation (only if alt trades exist) ----
+    if len(trade["alternate_index_trades"]) > 0:
+        if "best_index_evaluation" not in trade:
+            raise ValueError("[BEST_INDEX] Missing best_index_evaluation when alternate_index_trades exist")
+
+        required_best_index_keys = ["best_index", "basis", "comparison"]
+        for key in required_best_index_keys:
+            if key not in trade["best_index_evaluation"]:
+                raise ValueError(f"[BEST_INDEX] Missing field: '{key}'")
+
+        if not isinstance(trade["best_index_evaluation"]["comparison"], dict):
+            raise ValueError("[BEST_INDEX] comparison must be a dict")
+
+    print(f"[✓] Trade {trade['trade_id']} validated successfully")
+
+
+def validate_alt_trade(alt: dict, direction: str) -> None:
+    """Validate alternate index trade structure"""
+
+    REQUIRED_ALT_KEYS = [
+        "instrument",
+        "entry",
+        "sl",
+        "risk_points",
+        "planned_exits",
+        "actual_exits",
+        "mfe_price",
+        "mae_price",
+        "mae_points",
+        "post_exit_excursion_price",
+        "post_exit_excursion_capture_pct",
+        "post_sl_peep_price",
+        "post_sl_peep_capture_pct",
+        "realized_r",
+        "max_possible_r",
+        "mfe_capture_pct",
+        "reasoning",
+        "stop_loss_details",
+        "outcome"
+    ]
+
+    for key in REQUIRED_ALT_KEYS:
+        if key not in alt:
+            raise ValueError(f"[ALT] Missing field: '{key}'")
+
+    # ---- type checks ----
+    if alt["instrument"] not in ["ES", "NQ", "YM"]:
+        raise ValueError(f"[ALT] Invalid instrument: {alt['instrument']}")
+
+    if not isinstance(alt["entry"], (int, float)) or alt["entry"] == 0:
+        raise ValueError(f"[ALT] entry must be non-zero number, got: {alt['entry']}")
+
+    if not isinstance(alt["sl"], (int, float)) or alt["sl"] == 0:
+        raise ValueError(f"[ALT] sl must be non-zero number, got: {alt['sl']}")
+
+    # ---- risk points ----
+    expected_risk = abs(alt["entry"] - alt["sl"])
+    if abs(round(expected_risk, 2) - round(alt["risk_points"], 2)) > 0.01:
+        raise ValueError(
+            f"[ALT RISK] risk_points incorrect. "
+            f"Expected {expected_risk:.2f}, got {alt['risk_points']}"
+        )
+
+    # ---- MAE points ----
+    expected_mae = abs(alt["entry"] - alt["mae_price"])
+    if abs(round(expected_mae, 2) - round(alt["mae_points"], 2)) > 0.01:
+        raise ValueError(
+            f"[ALT MAE] mae_points incorrect. "
+            f"Expected {expected_mae:.2f}, got {alt['mae_points']}"
+        )
+
+    # ---- actual exits % ----
+    if len(alt["actual_exits"]) > 0:
+        total_exit_pct = sum(exit["close_pct_remaining"] for exit in alt["actual_exits"])
+        if total_exit_pct != 100:
+            raise ValueError(
+                f"[ALT EXITS] actual_exits close_pct_remaining must sum to 100, got {total_exit_pct}"
+            )
+    else:
+        raise ValueError("[ALT EXITS] actual_exits cannot be empty")
+
+    if len(alt["planned_exits"]) == 0:
+        raise ValueError("[ALT PLANNED_EXITS] planned_exits cannot be empty")
+
+    # ---- MFE/MAE prices ----
+    if not isinstance(alt["mfe_price"], (int, float)) or alt["mfe_price"] == 0:
+        raise ValueError(f"[ALT MFE] mfe_price must be non-zero number, got: {alt['mfe_price']}")
+
+    if not isinstance(alt["mae_price"], (int, float)) or alt["mae_price"] == 0:
+        raise ValueError(f"[ALT MAE] mae_price must be non-zero number, got: {alt['mae_price']}")
+
+    # ---- reasoning ----
+    if not isinstance(alt["reasoning"], str) or alt["reasoning"] == "":
+        raise ValueError(f"[ALT] reasoning must be non-empty string")
+
+    # ---- stop_loss_details ----
+    required_sl_keys = ["type", "distance_from_entry_points", "Was_hit", "closest_approach_points"]
+    for key in required_sl_keys:
+        if key not in alt["stop_loss_details"]:
+            raise ValueError(f"[ALT STOP_LOSS] Missing field: '{key}'")
+
+    if not isinstance(alt["stop_loss_details"]["type"], str) or alt["stop_loss_details"]["type"] == "":
+        raise ValueError(f"[ALT STOP_LOSS] type must be non-empty string")
+
+    # ---- outcome ----
+    required_outcome_keys = ["result", "win_quality"]
+    for key in required_outcome_keys:
+        if key not in alt["outcome"]:
+            raise ValueError(f"[ALT OUTCOME] Missing field: '{key}'")
+
+    if alt["outcome"]["result"] not in ["win", "loss"]:
+        raise ValueError(f"[ALT OUTCOME] Invalid result: {alt['outcome']['result']}")
+
+    if alt["outcome"]["win_quality"] not in ["full_target", "partial_target", "breakeven", "loss"]:
+        raise ValueError(f"[ALT OUTCOME] Invalid win_quality: {alt['outcome']['win_quality']}")
+
+    # ---- PSPP for alt trades ----
+    if alt["realized_r"] < 0:
+        if alt["post_sl_peep_price"] == "null":
+            raise ValueError("[ALT PSPP] Stopped out alt trade must have post_sl_peep_price")
+        if not isinstance(alt["post_sl_peep_price"], (int, float)):
+            raise ValueError(f"[ALT PSPP] post_sl_peep_price must be number for loss")
+    else:
+        if alt["post_sl_peep_price"] != "null":
+            raise ValueError(
+                f"[ALT PSPP] Winning alt trade must have 'null' for post_sl_peep_price, got: {alt['post_sl_peep_price']}")
+        if alt["post_sl_peep_capture_pct"] != "null":
+            raise ValueError(
+                f"[ALT PSPP] Winning alt trade must have 'null' for post_sl_peep_capture_pct, got: {alt['post_sl_peep_capture_pct']}")
