@@ -1,0 +1,131 @@
+"""
+risk_from_edge.py
+
+Bepaalt het % kapitaal dat geriskt mag worden op basis van:
+  a) edge score ranges
+  b) sessie-specifieke maximale caps
+
+Edge -> base risico regels:
+- edge < 75         => 0.5%
+- 75 <= edge < 85   => 1%
+- 85 <= edge <= 95  => 2%
+- edge > 95         => 3%
+
+Session caps (maximaal inzetbaar percentage in die sessie):
+- "killzone_morning"    => max 3%
+- "killzone_afternoon"  => max 2%
+- "extended_morning"    => max 2%
+- "market_open"         => max 1%
+
+Gedrag:
+- Bepaal basispercentage uit edge.
+- Als session_name is opgegeven en bekend, cap het basispercentage tot de sessie-max (indien lager).
+- Retourneer zowel het uiteindelijke percentage als metadata (basis, cap, was_gecapped).
+
+Functies:
+- risk_percentage_from_edge(edge_score) -> float (basis %)
+- get_session_cap(session_name) -> Optional[float] (cap % of None)
+- final_risk_percentage(edge_score, session_name=None) -> Dict met keys:
+    - 'final_pct' (float)
+    - 'base_pct' (float)
+    - 'session_cap_pct' (float | None)
+    - 'capped' (bool)
+- risk_fraction_from_edge_and_session(edge_score, session_name=None) -> float (decimale fractie)
+"""
+
+from typing import Optional, Dict, Union
+
+
+def _validate_edge(edge_score: Union[int, float]) -> float:
+    if not isinstance(edge_score, (int, float)):
+        raise TypeError("edge_score moet een getal (int of float) zijn.")
+    if edge_score != edge_score:  # NaN check
+        raise ValueError("edge_score is NaN.")
+    return float(edge_score)
+
+
+def risk_percentage_from_edge(edge_score: Union[int, float]) -> float:
+    """
+    Basis risico percentage gebaseerd op edge score.
+    Retourneert bv. 0.5, 1.0, 2.0, 3.0
+    """
+    edge = _validate_edge(edge_score)
+    if edge < 75:
+        return 0.5
+    if edge < 85:  # 75 <= edge < 85
+        return 1.0
+    if edge <= 95:  # 85 <= edge <= 95
+        return 2.0
+    return 3.0  # edge > 95
+
+
+# Sessies en hun maximale allowed risk in procent
+_SESSION_CAPS = {
+    "killzone_morning": 3.0,
+    "killzone_afternoon": 2.0,
+    "extended_morning": 2.0,
+    "market_open": 1.0,
+}
+
+
+def get_session_cap(session_name: Optional[str]) -> Optional[float]:
+    """
+    Geeft de session cap percentage terug voor een gegeven session_name.
+    session_name is case-insensitive. Als session_name None of onbekend -> None (geen cap).
+    """
+    if session_name is None:
+        return None
+    if not isinstance(session_name, str):
+        raise TypeError("session_name moet een string of None zijn.")
+    key = session_name.strip().lower()
+    return _SESSION_CAPS.get(key)
+
+
+def final_risk_percentage(edge_score: Union[int, float], session_name: Optional[str] = None) -> Dict[str, Union[float, bool, None]]:
+    """
+    Berekent het uiteindelijke risico percentage na toepassing van session cap (indien gegeven).
+
+    Retour:
+      {
+        'final_pct': float,          # uiteindelijke % (bv. 1.0)
+        'base_pct': float,           # basis van edge (bv. 2.0)
+        'session_cap_pct': float|None,# sessie cap indien bekend, anders None
+        'capped': bool,              # True als final_pct < base_pct
+      }
+    """
+    base = risk_percentage_from_edge(edge_score)
+    cap = get_session_cap(session_name)
+    if cap is None:
+        final = base
+        capped = False
+    else:
+        final = min(base, cap)
+        capped = final < base
+    return {"final_pct": float(final), "base_pct": float(base), "session_cap_pct": cap, "capped": bool(capped)}
+
+
+def risk_fraction_from_edge_and_session(edge_score: Union[int, float], session_name: Optional[str] = None) -> float:
+    """
+    Retourneert het uiteindelijke risico als fractie (bv. 0.01 voor 1%).
+    """
+    info = final_risk_percentage(edge_score, session_name)
+    return info["final_pct"] / 100.0
+
+
+if __name__ == "__main__":
+    # Voorbeelduitvoer voor verschillende edges en sessies
+    test_cases = [
+        (74.5, "killzone_morning"),
+        (80.0, "killzone_morning"),
+        (90.0, "killzone_morning"),
+        (97.0, "killzone_morning"),
+        (90.0, "killzone_afternoon"),
+        (90.0, "extended_morning"),
+        (90.0, "market_open"),
+        (70.0, None),  # geen sessie cap
+        (98.0, "unknown_session"),  # onbekende sessie => geen cap
+    ]
+
+    for edge, session in test_cases:
+        info = final_risk_percentage(edge, session)
+        print(f"edge={edge}, session={session!r} -> final {info['final_pct']}% (base {info['base_pct']}%, cap {info['session_cap_pct']}, capped={info['capped']})")
