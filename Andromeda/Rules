@@ -1,0 +1,447 @@
+from Confluences import *
+from datetime import time
+import logging
+from typing import Optional, Dict, Tuple, Any
+
+logger = logging.getLogger("confluences")
+
+
+# Timeframe ranking (higher number = higher timeframe power)
+_TF_RANK = {"5m": 3, "4m": 2, "3m": 1}
+
+
+def is_killzone_allowed(ts):
+    """
+    Determines which trading session the timestamp falls into.
+    Returns session name or None if outside trading hours.
+    """
+    t = ts.time()
+
+    if time(9, 30) <= t < time(9, 50):
+        return "market_open"
+    if time(9, 50) <= t <= time(10, 10):
+        return "killzone_morning"
+    if time(13, 0) <= t <= time(14, 0):
+        return "killzone_afternoon"
+    if time(10, 10) < t <= time(11, 0):
+        return "extended_morning"
+
+    return None
+
+
+# === LIQUIDITY SWEEP DETECTION (unchanged) ===
+def low_swept(df_es, df_nq, lookback=50):
+    key_low_es = df_es['low'].iloc[-lookback - 1:-1].min()
+    key_low_nq = df_nq['low'].iloc[-lookback - 1:-1].min()
+    min_key_low = min(key_low_es, key_low_nq)
+    current_low = min(df_es['low'].iloc[-1], df_nq['low'].iloc[-1])
+    current_close = min(df_es['close'].iloc[-1], df_nq['close'].iloc[-1])
+    return current_low < (min_key_low - 1) and current_close > min_key_low
+
+
+def high_swept(df_es, df_nq, lookback=50):
+    key_high_es = df_es['high'].iloc[-lookback - 1:-1].max()
+    key_high_nq = df_nq['high'].iloc[-lookback - 1:-1].max()
+    max_key_high = max(key_high_es, key_high_nq)
+    current_high = max(df_es['high'].iloc[-1], df_nq['high'].iloc[-1])
+    current_close = max(df_es['close'].iloc[-1], df_nq['close'].iloc[-1])
+    return current_high > (max_key_high + 1) and current_close < max_key_high
+
+
+def determine_bias(df_es, df_nq):
+    if low_swept(df_es, df_nq):
+        return "bullish", "low_sweep"
+    if high_swept(df_es, df_nq):
+        return "bearish", "high_sweep"
+    return None, None
+
+
+# === STEP 1: Liquidity Sweep (1H timeframe) ===
+def step_1_liq_sweep(df_1h_es, df_1h_nq):
+    return low_swept(df_1h_es, df_1h_nq, lookback=20) or high_swept(df_1h_es, df_1h_nq, lookback=20)
+
+
+# === CONFLUENCE EVALUATOR WITH STATE TRACKING ===
+class ConfluenceEvaluator:
+    """
+    Evaluator that:
+    - determines which timeframe (5m/4m/3m) satisfied step2 (BOS or iFVG on BOTH ES & NQ)
+      and prefers the highest timeframe if multiple apply (5m > 4m > 3m).
+    - snapshots the 5/4/3-minute structure state when step2 first becomes active so we can detect flips later.
+    - when step3 or step4 are reached, checks whether any monitored timeframe (equal-or-higher than used step2 tf)
+      has flipped to the opposite bias on either ES or NQ. If so, invalidates the trade.
+    - after all steps valid, checks for nearby liquidity in the bias route (0.15% threshold). If none found -> invalid.
+    - returns (valid: bool, details: dict) where details contains which step/index/timeframe flipped (if invalid).
+    """
+
+    def __init__(self):
+        # active_setup holds snapshot and metadata for the currently active candidate setup.
+        # None when no active setup being tracked.
+        # Structure:
+        # {
+        #   "direction": "bullish"/"bearish",
+        #   "used_step2_tf": "5m"/"4m"/"3m",
+        #   "snapshot": { "5m": {"ES": {...}, "NQ": {...}}, "4m": {...}, ... },
+        #   "timestamp": <optional>,
+        # }
+        self.active_setup: Optional[Dict[str, Any]] = None
+
+    # --- Helpers to read structure on a given tf ---
+    def _get_structure_state_for_tf(self, tf: str, df_es, df_nq, direction: str) -> Dict[str, Dict[str, bool]]:
+        """
+        Returns per-instrument booleans for structure used in step2:
+        {'ES': {'bos': bool, 'ifvg': bool}, 'NQ': {...}}
+        """
+        es_bos = detect_bos(df_es, direction)
+        nq_bos = detect_bos(df_nq, direction)
+        es_ifvg = detect_valid_ifvg(df_es, direction)
+        nq_ifvg = detect_valid_ifvg(df_nq, direction)
+        return {
+            "ES": {"bos": es_bos, "ifvg": es_ifvg},
+            "NQ": {"bos": nq_bos, "ifvg": nq_ifvg},
+        }
+
+    def _tf_rank(self, tf: str) -> int:
+        return _TF_RANK.get(tf, 0)
+
+    # --- Determine which TF satisfied step2 (prefers highest TF) ---
+    def _determine_step2_used_tf(
+        self,
+        dfs_by_tf: Dict[str, Tuple[Any, Any]],
+        direction: str,
+    ) -> Optional[str]:
+        """
+        dfs_by_tf: mapping like {'5m': (df_5m_es, df_5m_nq), '4m': (...), '3m': (...)}
+        Returns selected tf string or None if none satisfied.
+        Selection rule: choose highest TF (5m > 4m > 3m) for which BOTH ES and NQ show (BOS OR iFVG).
+        """
+        candidate_tfs = []
+        for tf, (df_es, df_nq) in dfs_by_tf.items():
+            if df_es is None or df_nq is None:
+                continue
+            bos_both = detect_bos(df_es, direction) and detect_bos(df_nq, direction)
+            ifvg_both = detect_valid_ifvg(df_es, direction) and detect_valid_ifvg(df_nq, direction)
+            if bos_both or ifvg_both:
+                candidate_tfs.append(tf)
+        if not candidate_tfs:
+            return None
+        # return highest-ranked tf
+        candidate_tfs.sort(key=self._tf_rank, reverse=True)
+        return candidate_tfs[0]
+
+    # --- Snapshot baseline state ---
+    def _snapshot_state(self, dfs_by_tf: Dict[str, Tuple[Any, Any]], direction: str, used_tf: str) -> Dict[str, Dict[str, Dict[str, bool]]]:
+        """
+        Create a snapshot of structure state for monitored TFs:
+        monitored TFs = all TFs with rank >= rank(used_tf) (i.e., used_tf and any higher TFs).
+        Snapshot format: { tf: { "ES": {"bos":..,"ifvg":..}, "NQ": {...} } }
+        """
+        used_rank = self._tf_rank(used_tf)
+        snapshot = {}
+        for tf, (df_es, df_nq) in dfs_by_tf.items():
+            if df_es is None or df_nq is None:
+                continue
+            if self._tf_rank(tf) >= used_rank:
+                snapshot[tf] = self._get_structure_state_for_tf(tf, df_es, df_nq, direction)
+        return snapshot
+
+    # --- Flip detection against snapshot ---
+    def _detect_flips_against_snapshot(
+        self,
+        snapshot: Dict[str, Dict[str, Dict[str, bool]]],
+        dfs_by_tf: Dict[str, Tuple[Any, Any]],
+        direction: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Compare current structure to snapshot. If any monitored TF/instrument shows
+        structure in the opposite direction, return a dict with details:
+        { "flipped_tf": tf, "flipped_instrument": 'ES'/'NQ', "snapshot": {...}, "current": {...} }
+        Opposite direction detection: detect_bos/ifvg for the opposite direction.
+        """
+        opposite = "bearish" if direction == "bullish" else "bullish"
+        for tf in sorted(snapshot.keys(), key=self._tf_rank, reverse=True):
+            current_pair = dfs_by_tf.get(tf)
+            if current_pair is None:
+                continue
+            df_es, df_nq = current_pair
+            # current structure in opposite direction
+            es_opposite = detect_bos(df_es, opposite) or detect_valid_ifvg(df_es, opposite)
+            nq_opposite = detect_bos(df_nq, opposite) or detect_valid_ifvg(df_nq, opposite)
+            # if either instrument now shows opposite structure -> flip
+            if es_opposite or nq_opposite:
+                flipped_instrument = "ES" if es_opposite else "NQ"
+                logger.debug("Flip detected: tf=%s, instrument=%s, opposite=%s", tf, flipped_instrument, opposite)
+                return {
+                    "flipped_tf": tf,
+                    "flipped_instrument": flipped_instrument,
+                    "opposite": opposite,
+                    "snapshot_for_tf": snapshot.get(tf),
+                    "current_for_tf": {
+                        "ES": {
+                            "bos_opposite": detect_bos(df_es, opposite),
+                            "ifvg_opposite": detect_valid_ifvg(df_es, opposite),
+                        },
+                        "NQ": {
+                            "bos_opposite": detect_bos(df_nq, opposite),
+                            "ifvg_opposite": detect_valid_ifvg(df_nq, opposite),
+                        },
+                    },
+                }
+        return None
+
+    # --- Liquidity proximity check ---
+    def _liquidity_nearby_in_bias(
+        self,
+        df_5m_es,
+        df_5m_nq,
+        direction: str,
+        pct_threshold: float = 0.0015,
+        lookback: int = 100,
+    ) -> Dict[str, Any]:
+        """
+        Check whether there is 'liquidity' close by in the bias route within pct_threshold (e.g., 0.0015 = 0.15%).
+        Simple heuristic:
+          - For bullish bias: look for recent highs (in lookback bars, excluding current bar) that are above current close
+            but within pct_threshold of current close.
+          - For bearish bias: look for recent lows that are below current close but within pct_threshold of current close.
+        Returns dict:
+          {
+            'found': bool,
+            'details': { 'ES': {...}, 'NQ': {...} }
+          }
+        Note: This is a heuristic; adapt to your liquidity definition if you have specific levels (e.g., orderbook).
+        """
+        result = {"found": False, "details": {"ES": {}, "NQ": {}}}
+        try:
+            # current close (use min/max similar to other code to be conservative)
+            cur_close_es = float(df_5m_es['close'].iloc[-1])
+            cur_close_nq = float(df_5m_nq['close'].iloc[-1])
+        except Exception as e:
+            logger.debug("Liquidity check skipped due to missing/current prices: %s", e)
+            result["found"] = False
+            result["reason"] = "missing_current_price"
+            return result
+
+        # function to check one df
+        def _check_df(df, cur_close, is_es: bool):
+            name = "ES" if is_es else "NQ"
+            try:
+                highs = df['high'].iloc[-lookback - 1:-1]  # exclude current bar
+                lows = df['low'].iloc[-lookback - 1:-1]
+            except Exception:
+                return {"found": False, "reason": "insufficient_history"}
+
+            if direction == "bullish":
+                # look for highs above current close but within threshold
+                candidates = highs[highs > cur_close]
+                if not candidates.empty:
+                    nearest = candidates.max()  # nearest above
+                    pct = (nearest - cur_close) / cur_close
+                    return {"found": pct <= pct_threshold, "level": float(nearest), "pct": float(pct)}
+                return {"found": False}
+            else:  # bearish
+                candidates = lows[lows < cur_close]
+                if not candidates.empty:
+                    nearest = candidates.min()  # nearest below
+                    pct = (cur_close - nearest) / cur_close
+                    return {"found": pct <= pct_threshold, "level": float(nearest), "pct": float(pct)}
+                return {"found": False}
+
+        es_res = _check_df(df_5m_es, cur_close_es, True)
+        nq_res = _check_df(df_5m_nq, cur_close_nq, False)
+
+        result["details"]["ES"] = es_res
+        result["details"]["NQ"] = nq_res
+        # If either ES or NQ has liquidity nearby consider it found
+        result["found"] = bool((es_res.get("found")) or (nq_res.get("found")))
+        if not result["found"]:
+            result["reason"] = f"no_liquidity_within_{pct_threshold*100:.2f}%"
+        return result
+
+    # --- Main evaluation routine (replaces previous shared_steps_complete) ---
+    def evaluate_shared_steps(
+        self,
+        df_1h_es,
+        df_1h_nq,
+        df_5m_es,
+        df_5m_nq,
+        df_1m_es,
+        df_1m_nq,
+        direction: str,
+        df_4m_es=None,
+        df_4m_nq=None,
+        df_3m_es=None,
+        df_3m_nq=None,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Evaluate confluence with historical tracking and flip invalidation logic.
+
+        Returns: (valid: bool, details: dict)
+        details includes:
+         - step1/step2/step3/step4 booleans
+         - used_step2_timeframe (if any)
+         - if invalidated: 'invalid_step' (3 or 4), 'flipped_timeframe', 'flipped_index', 'reason'
+         - snapshot and active_setup metadata when applicable
+         - liquidity check result when all steps were true
+        """
+
+        dfs_by_tf = {
+            "5m": (df_5m_es, df_5m_nq),
+            "4m": (df_4m_es, df_4m_nq),
+            "3m": (df_3m_es, df_3m_nq),
+        }
+
+        details: Dict[str, Any] = {}
+
+        # Step 1
+        step1 = step_1_liq_sweep(df_1h_es, df_1h_nq)
+        details["step1"] = bool(step1)
+
+        # Step 2: evaluate across 5/4/3 and choose highest that satisfies BOTH ES & NQ
+        used_step2_tf = self._determine_step2_used_tf(dfs_by_tf, direction)
+        details["used_step2_timeframe"] = used_step2_tf
+
+        # For backward compatibility, define step2 true if any TF satisfied
+        step2 = used_step2_tf is not None
+        details["step2"] = bool(step2)
+
+        # Step 3 (5m timeframe logic as before but accept either index on 5m OR 4m/3m if applicable)
+        # Here we keep original meaning: EQ retrace or FVG on either ES or NQ on 5m timeframe.
+        # For step3 we'll check the 5m df specifically (user logic) - keep same behavior as earlier.
+        eq_retrace = get_eq_retrace(df_5m_es) or get_eq_retrace(df_5m_nq)
+        fvg = detect_fvg(df_5m_es, direction) or detect_fvg(df_5m_nq, direction)
+        step3 = eq_retrace or fvg
+        details["step3"] = bool(step3)
+
+        # Step 4: 1m confirmations (unchanged)
+        fib_79 = (detect_79_fib_extension_close(df_1m_es, direction) or
+                  detect_79_fib_extension_close(df_1m_nq, direction))
+        bos_1m = detect_bos(df_1m_es, direction) or detect_bos(df_1m_nq, direction)
+        ifvg_1m = detect_valid_ifvg(df_1m_es, direction) or detect_valid_ifvg(df_1m_nq, direction)
+        step4 = fib_79 or bos_1m or ifvg_1m
+        details["step4"] = bool(step4)
+
+        # If step2 just became active now and no active snapshot exists or direction changed, snapshot baseline.
+        # This allows us to detect any flips that happen after step2 activation.
+        if step2:
+            if (
+                self.active_setup is None
+                or self.active_setup.get("direction") != direction
+                or self.active_setup.get("used_step2_tf") != used_step2_tf
+            ):
+                # create new active setup snapshot
+                snapshot = self._snapshot_state(dfs_by_tf, direction, used_step2_tf)
+                self.active_setup = {
+                    "direction": direction,
+                    "used_step2_tf": used_step2_tf,
+                    "snapshot": snapshot,
+                }
+                details["snapshot_created"] = True
+                details["snapshot"] = snapshot
+                logger.info("Created step2 snapshot: direction=%s, used_step2_tf=%s", direction, used_step2_tf)
+            else:
+                details["snapshot_exists"] = True
+                details["snapshot"] = self.active_setup.get("snapshot")
+        else:
+            # If step2 no longer true, clear any active snapshot for safety.
+            if self.active_setup is not None:
+                logger.info("Clearing active snapshot because step2 no longer satisfied.")
+            self.active_setup = None
+
+        # If we have step2 and are now in step3 or step4, check for flips against snapshot.
+        if step2 and (step3 or step4) and self.active_setup:
+            snapshot = self.active_setup["snapshot"]
+            flips = self._detect_flips_against_snapshot(snapshot, dfs_by_tf, direction)
+            if flips:
+                # determine which step triggered the invalidation (3 or 4)
+                invalid_step = 3 if step3 and not step4 else 4 if step4 and not step3 else (4 if step4 else 3)
+                details.update(
+                    {
+                        "valid": False,
+                        "invalid_step": invalid_step,
+                        "flipped_timeframe": flips["flipped_tf"],
+                        "flipped_index": flips["flipped_instrument"],
+                        "flip_details": flips,
+                        "reason": f"5/4/3-min structure flipped to opposite ({flips['opposite']}) on {flips['flipped_instrument']} at {flips['flipped_tf']}",
+                    }
+                )
+                logger.info(
+                    "Trade invalidated: step2 used_tf=%s, invalid_step=%s, flipped=%s on %s",
+                    self.active_setup.get("used_step2_tf"),
+                    invalid_step,
+                    flips["opposite"],
+                    flips["flipped_instrument"],
+                )
+                # clear active setup after invalidation
+                self.active_setup = None
+                return False, details
+
+        # final validity: all 4 steps must be true and no invalidation triggered above
+        all_steps = bool(step1 and step2 and step3 and step4)
+        details["valid"] = all_steps
+
+        # NEW: After all steps valid, perform liquidity proximity check (0.15%) on 5m for ES & NQ.
+        # If no liquidity found within threshold in bias route, invalidate the trade.
+        if all_steps:
+            liq_check = self._liquidity_nearby_in_bias(df_5m_es, df_5m_nq, direction, pct_threshold=0.0015, lookback=100)
+            details["liquidity_check"] = liq_check
+            if not liq_check.get("found", False):
+                details.update(
+                    {
+                        "valid": False,
+                        "invalid_step": "liquidity_proximity",
+                        "reason": f"No liquidity within 0.15% in bias route ({direction}) for ES/NQ",
+                    }
+                )
+                logger.info("Trade invalidated due to missing nearby liquidity in bias route: direction=%s", direction)
+                # clear active setup after invalidation
+                self.active_setup = None
+                return False, details
+
+        # include active_setup metadata for downstream inspection
+        if self.active_setup:
+            details["active_setup"] = {
+                "direction": self.active_setup.get("direction"),
+                "used_step2_tf": self.active_setup.get("used_step2_tf"),
+                "snapshot": self.active_setup.get("snapshot"),
+            }
+        logger.debug("Confluence evaluate result: %s", details)
+        return all_steps, details
+
+
+# === HELPER: Get confluence details for logging (kept similar to previous) ===
+def get_confluence_details(df_1h_es, df_1h_nq, df_5m_es, df_5m_nq, df_1m_es, df_1m_nq, direction):
+    confluence = []
+    if low_swept(df_1h_es, df_1h_nq, lookback=20):
+        confluence.append("1H lows swept → bullish")
+    if high_swept(df_1h_es, df_1h_nq, lookback=20):
+        confluence.append("1H highs swept → bearish")
+    if detect_bos(df_5m_es, direction):
+        confluence.append("5M BOS ES")
+    if detect_bos(df_5m_nq, direction):
+        confluence.append("5M BOS NQ")
+    if detect_valid_ifvg(df_5m_es, direction):
+        confluence.append("5M iFVG ES")
+    if detect_valid_ifvg(df_5m_nq, direction):
+        confluence.append("5M iFVG NQ")
+    if get_eq_retrace(df_5m_es):
+        confluence.append("EQ retrace ES")
+    if get_eq_retrace(df_5m_nq):
+        confluence.append("EQ retrace NQ")
+    if detect_fvg(df_5m_es, direction):
+        confluence.append("5M FVG ES")
+    if detect_fvg(df_5m_nq, direction):
+        confluence.append("5M FVG NQ")
+    if detect_79_fib_extension_close(df_1m_es, direction):
+        confluence.append("1M close 79% fib ES")
+    if detect_79_fib_extension_close(df_1m_nq, direction):
+        confluence.append("1M close 79% fib NQ")
+    if detect_bos(df_1m_es, direction):
+        confluence.append("1M BOS ES")
+    if detect_bos(df_1m_nq, direction):
+        confluence.append("1M BOS NQ")
+    if detect_valid_ifvg(df_1m_es, direction):
+        confluence.append("1M iFVG ES")
+    if detect_valid_ifvg(df_1m_nq, direction):
+        confluence.append("1M iFVG NQ")
+    return confluence
