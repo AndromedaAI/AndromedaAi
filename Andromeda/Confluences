@@ -1,0 +1,236 @@
+import numpy as np
+
+def detect_valid_ifvg(df, direction="bullish", lookback=50):
+    high = df['high'].values
+    low = df['low'].values
+    close = df['close'].values
+    for i in range(2, min(len(df), lookback)):
+        if direction == "bullish" and low[i-2] > high[i]:
+            top = low[i-2]
+            bottom = high[i]
+            if not any(close[j] > top for j in range(i+1, len(df))):
+                return {"top": top, "bottom": bottom}
+        elif direction == "bearish" and high[i-2] < low[i]:
+            top = high[i-2]
+            bottom = low[i]
+            if not any(close[j] < bottom for j in range(i+1, len(df))):
+                return {"top": top, "bottom": bottom}
+    return None
+
+def detect_fvg(df, direction="bullish"):
+    high = df['high'].values
+    low = df['low'].values
+    for i in range(2, len(df)):
+        if direction == "bullish" and low[i-2] > high[i]:
+            return {"top": low[i-2], "bottom": high[i]}
+        elif direction == "bearish" and high[i-2] < low[i]:
+            return {"top": high[i-2], "bottom": low[i]}
+    return None
+
+
+def detect_bos(df, direction="bullish", swing_lookback=10):
+    """
+    Detects break of structure by finding the most recent swing high/low
+    and checking if current price has broken it
+    """
+    highs = df['high'].values
+    lows = df['low'].values
+    closes = df['close'].values
+
+    if direction == "bullish":
+        # Find most recent significant swing low (lowest point in last 10 candles)
+        recent_swing_low = np.min(lows[-swing_lookback - 1:-1])  # Exclude current candle
+        # BOS = current close breaks above the high formed after that swing low
+        swing_high_after_low = np.max(highs[-swing_lookback - 1:-1])
+        return closes[-1] > swing_high_after_low
+
+    elif direction == "bearish":
+        # Find most recent significant swing high
+        recent_swing_high = np.max(highs[-swing_lookback - 1:-1])
+        swing_low_after_high = np.min(lows[-swing_lookback - 1:-1])
+        return closes[-1] < swing_low_after_high
+
+    return False
+
+
+def get_eq_retrace(df, lookback=50, tolerance_pct=0.002):  # 0.2% tolerance
+    highs = df['high'].rolling(lookback).max()
+    lows = df['low'].rolling(lookback).min()
+    eq = (highs + lows) / 2
+
+    tolerance = eq.iloc[-1] * tolerance_pct  # Dynamic based on price level
+    return abs(df['close'].iloc[-1] - eq.iloc[-1]) < tolerance
+
+def detect_79_fib_extension_close(df, direction="bullish"):
+    if direction == "bullish":
+        swing_low = df['low'].iloc[-50:].min()
+        swing_high = df['high'].iloc[-50:].max()
+        move_size = swing_high - swing_low
+        fib_79 = swing_low + 0.79 * move_size
+        return df['close'].iloc[-1] > fib_79
+    else:
+        swing_high = df['high'].iloc[-50:].max()
+        swing_low = df['low'].iloc[-50:].min()
+        move_size = swing_high - swing_low
+        fib_79 = swing_high - 0.79 * move_size
+        return df['close'].iloc[-1] < fib_79
+
+def _place_stop_loss(df_1min, direction, fvg=None):
+    lows_1m = df_1min['low'].values
+    highs_1m = df_1min['high'].values
+    if direction == "long":
+        sl_from_lows = np.min(lows_1m[-20:]) - 0.25
+        sl_from_fvg = fvg['bottom'] - 0.25 if fvg else sl_from_lows
+        sl = min(sl_from_lows, sl_from_fvg)
+    else:
+        sl_from_highs = np.max(highs_1m[-20:]) + 0.25
+        sl_from_fvg = fvg['top'] + 0.25 if fvg else sl_from_highs
+        sl = max(sl_from_highs, sl_from_fvg)
+    return round(sl, 2)
+
+
+def detect_smt_divergence(df_es, df_nq, direction="bullish", lookback=20):
+    """
+    Detects SMT divergence between ES and NQ
+    Bullish SMT: ES makes lower low, NQ makes higher low (NQ shows strength)
+    Bearish SMT: ES makes higher high, NQ fails to (NQ shows weakness)
+    """
+    es_highs = df_es['high'].values[-lookback:]
+    es_lows = df_es['low'].values[-lookback:]
+    nq_highs = df_nq['high'].values[-lookback:]
+    nq_lows = df_nq['low'].values[-lookback:]
+
+    if direction == "bullish":
+        # Check if ES made lower low but NQ didn't
+        es_recent_low = np.min(es_lows[-10:])
+        es_prev_low = np.min(es_lows[-20:-10])
+        nq_recent_low = np.min(nq_lows[-10:])
+        nq_prev_low = np.min(nq_lows[-20:-10])
+
+        if es_recent_low < es_prev_low and nq_recent_low > nq_prev_low:
+            return {"smt": True, "leader": "NQ", "lagger": "ES"}
+
+    elif direction == "bearish":
+        # Check if ES made higher high but NQ didn't
+        es_recent_high = np.max(es_highs[-10:])
+        es_prev_high = np.max(es_highs[-20:-10])
+        nq_recent_high = np.max(nq_highs[-10:])
+        nq_prev_high = np.max(nq_highs[-20:-10])
+
+        if es_recent_high > es_prev_high and nq_recent_high < nq_prev_high:
+            return {"smt": True, "leader": "ES", "lagger": "NQ"}
+
+    return None
+
+# --- NEW: 1m Volume Continuation Detector ---
+def detect_1m_volume_continuation(
+    df_1m,
+    direction="bullish",
+    fib_lookback=50,
+    no_struct_change_lookback=20,
+    vol_lookback=20,
+    vol_multiplier=1.5,
+):
+    """
+    Detect 1-minute "volume continuation" signal.
+
+    Logica:
+    - Vereist dat er in de recente 'no_struct_change_lookback' candles GEEN BOS of geldige iFVG is op 1m
+      (dus de structuur heeft niet duidelijk veranderd; price 'chopt' rond).
+    - Bereken de 79% extensie (zelfde als detect_79_fib_extension_close) op basis van de laatste fib_lookback bars.
+    - Detecteer of de laatste candle doorbreekt (close boven/onder 79% level) en dat de voorgaande candle
+      nog niet boven/onder dat level zat (crossing candle).
+    - Vereist dat de breakout-candle gepaard gaat met volume > vol_multiplier * gemiddelde(volume, last vol_lookback bars)
+    - Als alle condities voldaan zijn: return dict met details en "valid": True, anders return dict met "valid": False en reden.
+
+    Returns:
+      dict met keys:
+        - valid: bool
+        - reason: str (indien invalid)
+        - fib_79: float
+        - prev_close, close
+        - crossed: bool
+        - volume, avg_volume, volume_ratio
+    """
+    # basic length checks
+    min_required = max(fib_lookback, no_struct_change_lookback, vol_lookback) + 2
+    if len(df_1m) < min_required:
+        return {"valid": False, "reason": "insufficient_history", "min_required": min_required, "have": len(df_1m)}
+
+    # 1) ensure no recent BOS or iFVG on 1m in the no_struct_change_lookback window
+    try:
+        bos_present = detect_bos(df_1m, direction, swing_lookback=no_struct_change_lookback)
+    except Exception:
+        bos_present = False
+    try:
+        ifvg_present = detect_valid_ifvg(df_1m, direction, lookback=no_struct_change_lookback) is not None
+    except Exception:
+        ifvg_present = False
+
+    if bos_present or ifvg_present:
+        return {
+            "valid": False,
+            "reason": "structure_changed_recently",
+            "bos_present": bool(bos_present),
+            "ifvg_present": bool(ifvg_present),
+        }
+
+    # 2) compute 79% fib level on the lookback window
+    if direction == "bullish":
+        swing_low = df_1m['low'].iloc[-fib_lookback:].min()
+        swing_high = df_1m['high'].iloc[-fib_lookback:].max()
+        move_size = swing_high - swing_low
+        fib_79 = swing_low + 0.79 * move_size
+    else:
+        swing_high = df_1m['high'].iloc[-fib_lookback:].max()
+        swing_low = df_1m['low'].iloc[-fib_lookback:].min()
+        move_size = swing_high - swing_low
+        fib_79 = swing_high - 0.79 * move_size
+
+    prev_close = float(df_1m['close'].iloc[-2])
+    close = float(df_1m['close'].iloc[-1])
+
+    # crossing detection
+    if direction == "bullish":
+        crossed = (prev_close <= fib_79) and (close > fib_79)
+    else:
+        crossed = (prev_close >= fib_79) and (close < fib_79)
+
+    if not crossed:
+        return {"valid": False, "reason": "no_79_cross", "fib_79": float(fib_79), "prev_close": prev_close, "close": close, "crossed": False}
+
+    # 3) volume checks
+    if 'volume' not in df_1m.columns:
+        return {"valid": False, "reason": "no_volume_data", "fib_79": float(fib_79), "prev_close": prev_close, "close": close}
+
+    cur_vol = float(df_1m['volume'].iloc[-1])
+    avg_vol = float(df_1m['volume'].iloc[-vol_lookback - 1:-1].mean())
+    # avoid division by zero
+    avg_vol_safe = avg_vol if avg_vol > 0 else 1.0
+    vol_ratio = cur_vol / avg_vol_safe
+
+    if vol_ratio < vol_multiplier:
+        return {
+            "valid": False,
+            "reason": "no_volume_spike",
+            "fib_79": float(fib_79),
+            "prev_close": prev_close,
+            "close": close,
+            "volume": cur_vol,
+            "avg_volume": avg_vol,
+            "volume_ratio": float(vol_ratio),
+            "required_ratio": vol_multiplier,
+        }
+
+    # Passed all checks -> volume continuation detected
+    return {
+        "valid": True,
+        "reason": "volume_continuation",
+        "fib_79": float(fib_79),
+        "prev_close": prev_close,
+        "close": close,
+        "crossed": True,
+        "volume": cur_vol,
+        "avg_volume": avg_vol,
+        "volume_ratio": float(vol_ratio),
+    }
